@@ -1,150 +1,127 @@
-"""
-This logic is largely copied from the Hendrycks' MATH release (math_equivalence), and borrowed from:
-- https://github.com/microsoft/ProphetNet/tree/master/CRITIC
-- https://github.com/openai/prm800k
-"""
-import multiprocessing
-from math import isclose
-from typing import Union
+# The evaluator is adapted from the ToRA project
+# https://github.com/microsoft/ToRA
+# ToRA authors: Zhibin Gou and Zhihong Shao and Yeyun Gong and yelong shen and Yujiu Yang and Minlie Huang and Nan Duan and Weizhu Chen
 
-from sympy import simplify, N
-from sympy.parsing.sympy_parser import parse_expr
-from sympy.parsing.latex import parse_latex
+import argparse
+import numpy as np
+from tqdm import tqdm
+from pebble import ProcessPool
+from concurrent.futures import TimeoutError
+
+from eval.grader import *
+from utils.parser import *
+from utils.utils import load_jsonl
+from utils.python_executor import PythonExecutor
 
 
-def is_digit(s):
-    try:
-        float(str(s).replace(",", ""))
-        return True
-    except ValueError:
-        return False
-
-def math_equal(prediction: Union[bool, float, str],
-                reference: Union[float, str],
-                include_percentage: bool = True,
-                is_close: bool = True,
-                timeout: bool = False,
-                ) -> bool:
-    """
-    Exact match of math if and only if:
-    1. numerical equal: both can convert to float and are equal
-    2. symbolic equal: both can convert to sympy expression and are equal
-    """
-    try: # 1. numerical equal
-        if is_digit(prediction) and is_digit(reference):
-            prediction = float(str(prediction).replace(",", ""))
-            reference = float(str(reference).replace(",", ""))
-            # number questions
-            if include_percentage:
-                gt_result = [reference / 100, reference, reference * 100]
-            else:
-                gt_result = [reference]
-            for item in gt_result:
-                try:
-                    if is_close:
-                        if isclose(item, prediction, rel_tol=1e-4):
-                            return True
-                    else:
-                        if item == prediction:
-                            return True
-                except Exception:
-                    continue
-            return False
-    except:
-        pass
-
-    if not prediction and prediction not in [0, False]:
-        return False
-
-    # 2. symbolic equal
-    reference = str(reference).strip()
-    prediction = str(prediction).strip()
-
-    ## deal with [], (), {}
-    pred_str, ref_str = prediction, reference
-    if (prediction.startswith("[") and prediction.endswith("]") and not reference.startswith("(")) or \
-        (prediction.startswith("(") and prediction.endswith(")") and not reference.startswith("[")):
-        pred_str = pred_str.strip("[]()")
-        ref_str = ref_str.strip("[]()")
-    for s in ['{', "}", "(", ")"]:
-        ref_str = ref_str.replace(s, "")
-        pred_str = pred_str.replace(s, "")
-    if pred_str == ref_str:
-        return True
-
-    ## [a, b] vs. [c, d], return a==c and b==d
-    if (prediction.startswith("[") and prediction.endswith("]")) and (reference.startswith("[") and reference.endswith("]")) or \
-        (prediction.startswith("(") and prediction.endswith(")")) and (reference.startswith("(") and reference.endswith(")")):
-        pred_parts = prediction[1:-1].split(",")
-        ref_parts = reference[1:-1].split(",")
-        if len(pred_parts) == len(ref_parts):
-            if all([math_equal(pred_parts[i], ref_parts[i], include_percentage, is_close) for i in range(len(pred_parts))]):
-                return True
-
-    # symbolic equal with sympy
-    if timeout:
-        if call_with_timeout(symbolic_equal_process, prediction, reference):
-            return True
+def evaluate(data_name, prompt_type, samples: list=None, file_path: str=None, max_num_samples=None, execute=False):
+    assert samples or file_path, "samples or file_path must be provided"
+    if not samples:
+        samples = list(load_jsonl(file_path))
+    # dedup by idx
+    if 'idx' in samples[0]:
+        samples = {sample['idx']: sample for sample in samples}.values()
+        samples = sorted(samples, key=lambda x: x['idx']) 
     else:
-        if symbolic_equal(prediction, reference):
-            return True
+        samples = [dict(idx=idx, **sample) for idx, sample in enumerate(samples)]
 
-    return False
+    if max_num_samples:
+        print(f"max_num_samples: {max_num_samples} / {len(samples)}")
+        samples = samples[:max_num_samples]
+    
+    # parse gt
+    for sample in samples:
+        sample['gt_cot'], sample['gt'] = parse_ground_truth(sample, data_name)
+
+    # execute
+    if ('pred' not in samples[0]) or execute:
+        if "pal" in prompt_type:
+            executor = PythonExecutor(get_answer_expr="solution()")
+        else:
+            executor = PythonExecutor(get_answer_from_stdout=True)
+
+        for sample in tqdm(samples, desc="Execute"):
+            sample['pred'] = []
+            sample['report'] = []
+            for code in sample['code']:
+                pred, report = run_execute(executor, code, prompt_type, execute=True)
+                sample['pred'].append(pred)
+                sample['report'].append(report)
+
+    params = [(idx, pred, sample['gt']) for idx, sample in enumerate(samples) for pred in sample['pred']]
+
+    scores = []
+    timeout_cnt = 0 
+
+    with ProcessPool() as pool:
+        future = pool.map(math_equal_process, params, timeout=10)
+        iterator = future.result()
+        with tqdm(total=len(samples), desc="Evaluate") as progress_bar:
+            while True:
+                try:
+                    result = next(iterator)
+                    scores.append(result)
+                except StopIteration:
+                    break
+                except TimeoutError as error:
+                    print(error)
+                    scores.append(False)
+                    timeout_cnt += 1
+                except Exception as error:
+                    print(error.traceback)
+                    exit()
+                progress_bar.update(1) 
+
+    idx = 0
+    score_mat = []
+    for sample in samples:
+        sample['score'] = scores[idx: idx+len(sample['pred'])]
+        assert len(sample['score']) == len(sample['pred'])
+        score_mat.append(sample['score'])
+        idx += len(sample['pred'])
+
+    max_len = max([len(s) for s in score_mat])
+
+    for i, s in enumerate(score_mat):
+        if len(s) < max_len:
+            score_mat[i] = s + [s[-1]] * (max_len - len(s)) # pad
+
+    # output mean of each column of scores
+    col_means= np.array(score_mat).mean(axis=0)
+    mean_score = list(np.round(col_means * 100, decimals=1))
+
+    result_str = f"Num samples: {len(samples)}\n" \
+        f"Num scores: {len(scores)}\n" \
+        f"Timeout samples: {timeout_cnt}\n" \
+        f"Empty samples: {len([s for s in samples if not s['pred'][-1]])}\n" \
+        f"Mean score: {mean_score}\n"
+
+    # each type score
+    if "type" in samples[0]:
+        type_scores = {}
+        for sample in samples:
+            if sample['type'] not in type_scores:
+                type_scores[sample['type']] = []
+            type_scores[sample['type']].append(sample['score'][-1])
+        type_scores = {k: np.round(np.array(v).mean() * 100, decimals=1) for k, v in type_scores.items()}
+        type_scores = {k: v for k, v in sorted(type_scores.items(), key=lambda item: item[0])}
+        result_str += f"Type scores: {type_scores}\n"
+
+    print(result_str)
+    return result_str
 
 
-def math_equal_process(param):
-    return math_equal(param[-2], param[-1])
-
-
-def symbolic_equal(a, b):
-    def _parse(s):
-        for f in [parse_latex, parse_expr]:
-            try:
-                return f(s)
-            except:
-                pass
-        return s
-    a = _parse(a)
-    b = _parse(b)
-
-    try:
-        if simplify(a-b) == 0:
-            return True
-    except:
-        pass
-
-    try:
-        if isclose(N(a), N(b), rel_tol=1e-3):
-            return True
-    except:
-        pass
-    return False
-
-
-def symbolic_equal_process(a, b, output_queue):  
-    result = symbolic_equal(a, b)
-    output_queue.put(result)  
-
-
-def call_with_timeout(func, *args, timeout=1, **kwargs):  
-    output_queue = multiprocessing.Queue()  
-    process_args = args + (output_queue,)  
-    process = multiprocessing.Process(target=func, args=process_args, kwargs=kwargs)  
-    process.start()  
-    process.join(timeout)  
-  
-    if process.is_alive():  
-        process.terminate()  
-        process.join()  
-        return False  
-  
-    return output_queue.get()
-
-
-def _test_math_equal():
-    # print(math_equal("0.0833333333333333", "\\frac{1}{12}"))
-    # print(math_equal("(1,4.5)", "(1,\\frac{9}{2})"))
-    print(math_equal("\\frac{x}{7}+\\frac{2}{7}", "\\frac{x+2}{7}", timeout=True))
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_name", type=str, default="math")
+    parser.add_argument("--prompt_type", type=str, default="tora")
+    parser.add_argument("--file_path", type=str, default=None, required=True)
+    parser.add_argument("--max_num_samples", type=int, default=None)
+    parser.add_argument("--execute", action="store_true")
+    args = parser.parse_args()
+    return args
 
 if __name__ == "__main__":
-    _test_math_equal()
+    args = parse_args()
+    evaluate(data_name=args.data_name, prompt_type=args.prompt_type, file_path=args.file_path,
+             max_num_samples=args.max_num_samples, execute=args.execute)
