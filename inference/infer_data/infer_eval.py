@@ -2,7 +2,7 @@
 This scrip support is adapted from Tora project and supports multi-rounds vllm inference.
 The inference is formulated as a multi-turn chat and the model should be registered as a server by scripts/register_server.sh first.
 """
-
+import json
 import argparse
 import os
 import random
@@ -47,8 +47,11 @@ def parse_args():
 
 
 def prepare_data(args):
-    examples = load_data(args.data_name, args.split, args.data_dir)
-
+    #examples = load_data(args.data_name, args.split, args.data_dir)
+    from datasets import load_dataset
+    ds = load_dataset(args.data_name, split='train')
+    examples = [sample for sample in ds]
+    #print(examples[:1])
     # sample `num_test_sample` from dataset
     if args.num_test_sample > 0:
         examples = random.sample(examples, args.num_test_sample)
@@ -108,7 +111,9 @@ def main(args):
     SamplingParams.seed = args.seed
     # load model and determine the number of gpus used
     if "gemma" in args.model_name_or_path:
-        stop_tokens = ["<end_of_turn>", "<eos>", "```output", "<start_of_turn>"]
+        stop_tokens=[ "<end_of_turn>", "<eos>", "```output", "<start_of_turn>"]
+        #["\n\n**4", "\n\nStep 4", "\n\n4", "<end_of_turn>", "<eos>", "```output", "<start_of_turn>"]
+        #stop_tokens = ["<end_of_turn>", "<eos>", "```output", "<start_of_turn>"]
     elif "mistral" in args.model_name_or_path:
         stop_tokens = ["<s>", "</s>", "[INST]", "```output"]
     elif "deepseek" in args.model_name_or_path:
@@ -143,13 +148,15 @@ def main(args):
         idx = example["idx"]
 
         # parse question and answer
-        example["question"] = parse_question(example, args.data_name)
-        gt_cot, gt_ans = parse_ground_truth(example, args.data_name)
+        #example["question"] = parse_question(example, args.data_name)
+        #gt_cot, gt_ans = parse_ground_truth(example, args.data_name)
 
-        full_prompt = construct_prompt(args, example)
-
-        sample = {"idx": idx, "question": example["question"], "gt_cot": gt_cot, "gt": gt_ans, "prompt": full_prompt}
+        full_prompt = example['new_prompt']
+        #construct_prompt(args, example)
+        sample = {"idx": idx, 'gt': "", "type": example['type'], 'solution': example['solution'], "new_prompt": full_prompt, 'old_prompt': example['prompt'], 'old_solution': example['my_solu']}
+        #sample = {"idx": idx, 'gt': "", "type": example['type'], 'solution': example['solution'], "prompt": full_prompt}
         # add remain fields
+        #sample = {"idx": idx, "gt": example['gt'], "prompt": example['my_solu'][0]}
         for key in [
             "level",
             "type",
@@ -173,11 +180,11 @@ def main(args):
     print("dataset:", args.data_name, "samples:", len(samples))
     if len(samples) > 0:
         print("-" * 50)
-        print("sample:", samples[0]["prompt"])
+        print("sample:", samples[0]["new_prompt"])
         print("-" * 50)
 
     # repeat H times
-    remain_prompts = [sample["prompt"] for sample in samples for _ in range(args.n_sampling)]
+    remain_prompts = [sample["new_prompt"] for sample in samples for _ in range(args.n_sampling)]
     remain_prompts = [(i, prompt) for i, prompt in enumerate(remain_prompts)]
     all_gts = [sample["gt"] for sample in samples for _ in range(args.n_sampling)]
 
@@ -251,8 +258,6 @@ def main(args):
                 #exec_result = f"<｜end▁of▁sentence｜>User: ```output\n{exec_result}\n```\n\nAssistant:"
                 #for deepseek, we directly append the observation as the training of deepseek
                 exec_result = f"\n```output\n{exec_result}\n```\n"
-            elif "llama3" in args.model_name_or_path:
-                exec_result = f"<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n```output\n{exec_result}\n```<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
             else:
                 raise NotImplementedError(args.prompt_type + "and " + args.model_name_or_path)
 
@@ -274,6 +279,9 @@ def main(args):
         ans_split = "[/INST]"
     elif "deepseek" in args.model_name_or_path:
         ans_split = "\n\nAssistant:"
+    elif "llama3" in args.model_name_or_path:
+        ans_split= "<|start_header_id|>assistant<|end_header_id|>"
+        #exec_result = f"<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n```output\n{exec_result}\n```<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     else:
         raise NotImplementedError(args.prompt_type + "and " + args.model_name_or_path)
 
@@ -293,8 +301,8 @@ def main(args):
         preds = [item[0] for item in result]
         reports = [item[1] for item in result]
         response_tmp = tmp_to_store[i * args.n_sampling : (i + 1) * args.n_sampling]
-        sample.pop("prompt")
-        sample.update({"my_solu": response_tmp, "code": code, "pred": preds, "report": reports})
+        #sample.pop("prompt")
+        sample.update({"my_solu": response_tmp})#, "code": code, "pred": preds, "report": reports})
         all_samples.append(sample)
 
     # add processed samples
