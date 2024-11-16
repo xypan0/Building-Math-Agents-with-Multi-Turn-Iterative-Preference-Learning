@@ -1,74 +1,104 @@
-import os
 import json
+import os
 import random
-from datasets import load_dataset, Dataset, concatenate_datasets
-from utils.utils import load_jsonl, lower_keys
+from pathlib import Path
+from typing import Any, Iterable, Union
 
-def load_data(data_name, split, data_dir='./data'):
-    data_file = f"{data_dir}/{data_name}/{split}.jsonl"
-    if os.path.exists(data_file):
-        examples = list(load_jsonl(data_file))
-    else:
-        if data_name == "math":
-            dataset = load_dataset("competition_math", split=split, name="main", cache_dir=f"{data_dir}/temp")
-        elif "RLHF4MATH/prompt_iter" in data_name:
-            # if we use the pre-processed prompts
-            dataset = load_dataset(data_name, split=split)
-        elif data_name == "theorem-qa":
-            dataset = load_dataset("wenhu/TheoremQA", split=split)
-        elif data_name == "gsm8k":
-            dataset = load_dataset(data_name, split=split)
-        elif data_name == "gsm-hard":
-            dataset = load_dataset("reasoning-machines/gsm-hard", split="train")
-        elif data_name == "svamp":
-            # evaluate on training set + test set 
-            dataset = load_dataset("ChilleD/SVAMP", split="train")
-            dataset = concatenate_datasets([dataset, load_dataset("ChilleD/SVAMP", split="test")])
-        elif data_name == "asdiv":
-            dataset = load_dataset("EleutherAI/asdiv", split="validation")
-            dataset = dataset.filter(lambda x: ";" not in x['answer']) # remove multi-answer examples
-        elif data_name == "mawps":
-            examples = []
-            # four sub-tasks
-            for data_name in ["singleeq", "singleop", "addsub", "multiarith"]:
-                sub_examples = list(load_jsonl(f"{data_dir}/mawps/{data_name}.jsonl"))
-                for example in sub_examples:
-                    example['type'] = data_name
-                examples.extend(sub_examples)
-            dataset = Dataset.from_list(examples)
-        elif data_name == "finqa":
-            dataset = load_dataset("dreamerdeo/finqa", split=split, name="main")
-            dataset = dataset.select(random.sample(range(len(dataset)), 1000))
-        elif data_name == "tabmwp":
-            examples = []
-            with open(f"{data_dir}/tabmwp/tabmwp_{split}.json", "r") as f:
-                data_dict = json.load(f)
-                examples.extend(data_dict.values())
-            dataset = Dataset.from_list(examples)
-            dataset = dataset.select(random.sample(range(len(dataset)), 1000))
-        elif data_name == "bbh":
-            examples = []
-            for data_name in ["reasoning_about_colored_objects", "penguins_in_a_table",\
-                            "date_understanding", "repeat_copy_logic", "object_counting"]:
-                with open(f"{data_dir}/bbh/bbh/{data_name}.json", "r") as f:
-                    sub_examples = json.load(f)["examples"]
-                    for example in sub_examples:
-                        example['type'] = data_name
-                    examples.extend(sub_examples)
-            dataset = Dataset.from_list(examples)
+import numpy as np
+
+
+def set_seed(seed: int = 42) -> None:
+    np.random.seed(seed)
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    print(f"Random seed set as {seed}")
+
+
+def load_jsonl(file: Union[str, Path]) -> Iterable[Any]:
+    with open(file, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                yield json.loads(line)
+            except:
+                print("Error in loading:", line)
+                exit()
+
+
+def save_jsonl(samples, save_path):
+    # ensure path
+    folder = os.path.dirname(save_path)
+    os.makedirs(folder, exist_ok=True)
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        for sample in samples:
+            f.write(json.dumps(sample) + "\n")
+    print("Saved to", save_path)
+
+
+def lower_keys(example):
+    new_example = {}
+    for key, value in example.items():
+        if key != key.lower():
+            new_key = key.lower()
+            new_example[new_key] = value
         else:
-            raise NotImplementedError(data_name)
+            new_example[key] = value
+    return new_example
 
-        examples = list(dataset)
-        examples = [lower_keys(example) for example in examples]
-        dataset = Dataset.from_list(examples)
-        os.makedirs(f"{data_dir}/{data_name}", exist_ok=True)
-        dataset.to_json(data_file)
 
-    # add 'idx' in the first column
-    if 'idx' not in examples[0]:
-        examples = [{'idx': i, **example} for i, example in enumerate(examples)]
+def construct_prompt(args, example):
+    if args.prompt_type == "tora":
+        if "gemma" in args.model_name_or_path:
+            full_prompt = f"<bos><start_of_turn>user\n{example['question']}<end_of_turn>\n<start_of_turn>model\n"
+        elif "mistral" in args.model_name_or_path:
+            full_prompt = f"<s> [INST] {example['question']} [/INST]"
+        elif "deepseek" in args.model_name_or_path:
+            full_prompt = f"User: {example['question']}\nPlease integrate natural language reasoning with programs to solve the problem above, and put your final answer within \\boxed{{}}.\n\nAssistant: "
+        else:
+            raise NotImplementedError(args.prompt_type + "and " + args.model_name_or_path)
+    elif args.prompt_type == "cot":
+        if "gemma" in args.model_name_or_path:
+            full_prompt = f"<bos><start_of_turn>user\n{example['question']}\nPlease reason step by step.<end_of_turn>\n<start_of_turn>model\n"
+        elif "mistral" in args.model_name_or_path:
+            full_prompt = f"<s> [INST] {example['question']}\nPlease reason step by step, and put your final answer within \\boxed{{}}. [/INST]"
+        elif "deepseek" in args.model_name_or_path:
+            full_prompt = f"User: {example['question']}\nPlease reason step by step, and put your final answer within \\boxed{{}}.\n\nAssistant: "
+        elif "llama3" in args.model_name_or_path:
+            full_prompt = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{example['question']}\nPlease reason step by step, and put your final answer within \\boxed{{}}.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        else:
+            raise NotImplementedError(args.prompt_type + "and " + args.model_name_or_path)
 
-    # dedepulicate & sort
-    examples = sorted(examples, key=lambda x: x['idx'])
-    return examples
+    return full_prompt
+
+
+key_map = {
+    "gt": "Ground Truth",
+    "pred": "Prediction",
+    "gt_cot": "Reference CoT",
+    "score": "Score",
+}
+
+
+def show_sample(sample, print_all_preds=False):
+    print("==" * 20)
+    for key in ["idx", "type", "level", "dataset"]:
+        if key in sample:
+            # capitalize
+            print("{}: {}".format(key[0].upper() + key[1:], sample[key]))
+    print("Question:", repr(sample["question"]))
+    if "code" in sample:
+        if print_all_preds:
+            for code in sample["code"]:
+                print("-" * 20)
+                print("code:", code)
+            print("Execution:", sample["report"])
+        else:
+            print("Solution:\n", sample["code"][0])
+            print("Execution:", sample["report"][0])
+    if "pred" in sample:
+        print("Prediction:", repr(sample["pred"][0]))
+    for key in ["gt", "score", "unit", "gt_cot"]:
+        if key in sample:
+            _key = key_map.get(key, key)
+            print("{}: {}".format(_key, repr(sample[key])))
+    print()
