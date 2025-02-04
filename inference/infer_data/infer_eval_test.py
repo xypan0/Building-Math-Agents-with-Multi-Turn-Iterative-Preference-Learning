@@ -137,6 +137,7 @@ def main(args):
             **args,
             "prompt": prompt,
         }
+        print(json)
         response = requests.post(url="http://localhost" + ":" + str(port) + "/generate", json=json)
         response_json = response.json()
         return [response_json["text"][i][len(prompt) :] for i in range(len(response_json["text"]))]

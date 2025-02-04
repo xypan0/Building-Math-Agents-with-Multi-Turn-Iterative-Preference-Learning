@@ -10,7 +10,7 @@ fi
 MODEL_PATH=$1
 
 # generate 8 server instances
-for i in {0..7}
+for i in 0
 do
     CUDA_VISIBLE_DEVICES=$i python -m vllm.entrypoints.api_server \
         --model $MODEL_PATH \
